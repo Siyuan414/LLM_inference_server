@@ -9,6 +9,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <vector>
 
 static int failures = 0;
 
@@ -20,6 +21,10 @@ static int failures = 0;
          if (_a != _b) { printf("  FAIL %s: got %lld want %lld (%s:%d)\n", \
                                 msg, (long long)_a, (long long)_b,         \
                                 __FILE__, __LINE__); ++failures; } } while (0)
+
+#define CHECK_THROWS(expr, msg)                                            \
+    do { bool _t = false; try { (void)(expr); } catch (...) { _t = true; } \
+         CHECK(_t, msg); } while (0)
 
 int main() {
     // ── blocks_for: ceiling division ─────────────────────────────────────────
@@ -249,6 +254,60 @@ int main() {
         CHECK(a.fits_ever(128), "128 tokens = 8 blocks <= 10 - 2");
         CHECK(!a.fits_ever(200), "200 tokens = 13 blocks can never fit");
         CHECK(!a.fits_ever(160), "160 tokens = 10 blocks exceeds the watermark");
+    }
+    
+    // Each case names the bug it exists to catch. A test that no plausible bug
+    // would fail is not protecting anything.
+    {
+        printf("truncate: frees every excess block\n");
+        BlockAllocator a;
+        a.configure({16, 10, 0});
+        a.allocate(1, 50);                          // blocks_for(50) = 4
+        const int before = a.num_free();
+        const int freed = a.truncate(1, 31);        // blocks_for(31) = 2
+        CHECK_EQ(freed, 2, "loop must free every excess block");
+        CHECK_EQ(a.table(1).size(), 2u, "table shrinks to 2");
+        CHECK_EQ(a.num_free(), before + 2, "freed blocks reach the free list");
+    }
+    {
+        printf("truncate: inside the last block frees nothing\n");
+        BlockAllocator a;
+        a.configure({16, 10, 0});
+        a.allocate(1, 35);                          // blocks_for(35) = 3
+        CHECK_EQ(a.truncate(1, 33), 0, "a length still inside the last block frees nothing");
+        CHECK_EQ(a.table(1).size(), 3u, "table unchanged");
+    }
+    {
+        printf("truncate: to zero keeps the sequence\n");
+        BlockAllocator a;
+        a.configure({16, 10, 0});
+        a.allocate(1, 48);                          // 3 blocks
+        CHECK_EQ(a.truncate(1, 0), 3, "truncate to 0 frees every block");
+        CHECK(a.has(1), "truncate to 0 keeps the sequence (unlike release)");
+        CHECK_EQ(a.table(1).size(), 0u, "empty table");
+        CHECK_EQ(a.num_free(), 10, "whole pool free again");
+        CHECK(a.append_tokens(1, 0, 20), "an emptied sequence can grow again");
+    }
+    {
+        printf("truncate: re-grow returns the same blocks in order\n");
+        BlockAllocator a;
+        a.configure({16, 10, 0});
+        a.allocate(1, 50);
+        const std::vector<int> orig = a.table(1);   // a COPY: a reference would
+                                                    // change with the table
+        a.truncate(1, 31);
+        CHECK(a.append_tokens(1, 31, 19), "re-grow 31 -> 50");
+        CHECK(a.table(1) == orig, "re-grow returns the same blocks in order");
+    }
+    {
+        printf("truncate: invalid requests throw\n");
+        BlockAllocator a;
+        a.configure({16, 10, 0});
+        a.allocate(1, 31);                          // 2 blocks
+        CHECK_THROWS(a.truncate(1, 50), "cannot grow through truncate");
+        CHECK_THROWS(a.truncate(1, -1), "negative length must throw, not wipe");
+        CHECK_THROWS(a.truncate(99, 0), "unknown sequence must throw");
+        CHECK_EQ(a.table(1).size(), 2u, "a rejected truncate changes nothing");
     }
 
     printf("\n%s\n", failures ? "FAILED" : "all tests passed");

@@ -243,6 +243,24 @@ public:
         return blocks_for(n_tokens) <= cfg_.num_blocks - cfg_.watermark;
     }
 
+    /// Shrink seq_id's table to cover exactly new_len tokens. Blocks beyond
+    /// blocks_for(new_len) go back to the free list. GPU memory is not touched.
+    /// Returns the number of blocks freed.
+    int truncate(uint64_t seq_id, int new_len){
+        auto it = tables_.find(seq_id);
+        if(it == tables_.end()) throw std::runtime_error("truncate: sequence not found");
+        if (new_len < 0) throw std::invalid_argument("truncate: negative new_len");
+        auto& t = it->second;
+        const int have = (int)t.size();
+        const int want = blocks_for(new_len);
+        if (want > have) throw std::runtime_error("truncate: new_len beyond table coverage");       
+        while((int)t.size() > want){
+            free_.push_back(t.back());
+            t.pop_back();
+        }
+        return have - want;
+    }
+
 private:
     Config cfg_{};
     std::vector<int> free_;                                  // stack of block ids
