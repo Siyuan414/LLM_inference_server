@@ -305,7 +305,7 @@ int main(int argc, char** argv) {
     { auto w = oracle(E, prompts[0], 8, tok); (void)w; }
 
     printf("\n%zu prompts, n_gen %d, K %d\n\n", prompts.size(), n_gen, K);
-    printf("  #   verdict              tokens  oracle ms/tok  spec ms/tok  speedup\n");
+    printf("  #   verdict              tokens   tau  oracle ms/tok  spec ms/tok  speedup\n");
 
     SpecStats st;
     st.accepted_hist.assign(K + 1, 0);
@@ -316,6 +316,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < prompts.size(); ++i) {
         const GenResult o = oracle(E, prompts[i], n_gen, tok);
         bool implemented = true;
+        const long r0 = st.rounds, e0 = st.emitted;
         const GenResult s = speculative(E, prompts[i], n_gen, K, tok, st, implemented);
         if (!implemented) {
             printf("\nspec_round() returned 0 — not implemented yet. Oracle ran fine:\n"
@@ -340,8 +341,9 @@ int main(int argc, char** argv) {
         // Decode-only rates; the first token comes from prefill in both.
         const double o_rate = o.decode_ms / std::max<size_t>(1, o.gen.size() - 1);
         const double s_rate = s.decode_ms / std::max<size_t>(1, s.gen.size() - 1);
-        printf("  %-3zu %-20s %6zu  %13.2f  %11.2f  %6.2fx\n",
-               i, verdict, s.gen.size(), o_rate, s_rate, o_rate / s_rate);
+        const double tau_i = (double)(st.emitted - e0) / std::max(1L, st.rounds - r0);
+        printf("  %-3zu %-20s %6zu  %4.2f  %13.2f  %11.2f  %6.2fx\n",
+               i, verdict, s.gen.size(), tau_i, o_rate, s_rate, o_rate / s_rate);
         o_dec += o.decode_ms; s_dec += s.decode_ms;
         o_pre += o.prefill_ms; s_pre += s.prefill_ms;
         o_tok += (long)o.gen.size() - 1; s_tok += (long)s.gen.size() - 1;
