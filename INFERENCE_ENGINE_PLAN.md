@@ -20,6 +20,10 @@ The split that emerged in practice: anything an interviewer would ask about — 
 scheduler policy, cache design — you write. Plumbing — CLI parsing, buffer allocation,
 test harnesses, benchmark scripts — gets written for you.
 
+**From Stage 5 on, predictions are a gate:** every run is preceded by a written
+prediction (a number and one line of reasoning), and the result is compared against
+it. Explaining a number after seeing it is not the same skill as predicting it.
+
 **Ordering principle (learned the hard way at the vLLM comparison):** measure before
 building. The comparison was planned for Stage 4 and run early instead; it replaced the
 planned next feature (speculative decoding) with the one the numbers demanded (chunked
@@ -272,31 +276,222 @@ droop within one run), and **verify the binary changed before explaining a resul
 (an entire mechanism was theorized for a slowdown that turned out to be an
 unrebuilt kernel plus a background game).
 
-## Stage 5 — Speculative decoding
+## Stage 5 — Speculative decoding ← in progress
 
-Deliberately *after* the kernel work, and for a reason the benchmarks made explicit:
-speculative decoding spends idle arithmetic capacity to buy single-stream latency,
-and at concurrency 32 the GPU is already compute-saturated — it would likely *reduce*
-throughput. It is a low-concurrency latency feature, not a throughput feature.
+A low-concurrency latency feature, not a throughput feature: it spends idle
+arithmetic to buy single-stream TPOT. Target **Llama-3.2-3B**, draft **Llama-3.2-1B**
+(the smallest model sharing LLaMA-3's 128,256-token vocabulary). Greedy only —
+`serve_chunked` has no sampling path yet; the probabilistic acceptance rule moves to
+Stage 11 with sampling.
 
-- **S5.1** Draft model + its own KV pool. One `BlockAllocator` and one block table
-  serve both models (logical→physical mapping is model-independent); only the
-  per-block byte stride differs.
-- **S5.2** `BlockAllocator::truncate(seq_id, new_len)` — rollback. The first
-  operation in this system that makes a sequence *shrink*; everything so far only
-  grows, which is why `append_tokens` may assume `have >= blocks_for(cur_len)`.
-- **S5.3** Acceptance sampling — accept draft token `x` with probability
-  `min(1, p_target(x)/p_draft(x))`, resample from `max(0, p_target − p_draft)` on
-  rejection. This makes the output distribution provably identical to plain
-  sampling; speculative decoding is exact, not an approximation.
-- **S5.4** Benchmark at concurrency **1 and 4**, not 32. Measuring at 32 would
-  correctly implement the feature and record a regression.
+| | Status | Delivered |
+|---|---|---|
+| S5.0 | ✅ | `tools/spec_measure.cu` — predicts the speedup *before* building anything: `c_t`, `c_d`, `c_v(K)` timed; `tau(K)` from teacher forcing (exact for greedy) |
+| S5.1 | ✅ | `BlockAllocator::truncate()` — the first operation that shrinks a sequence. Validates before mutating; 5 isolated tests, each naming the bug it catches |
+| S5.2 | ✅ | `tools/spec_offline.cu` — greedy spec loop at batch 1: two KV pools, one allocator, one block table; checked against plain 3B greedy |
+| S5.3a | ✅ | `ChunkScheduler::Config::decode_tokens` — decoders take K+1 tokens; block-boundary test (`prefill got 64, not 384`) |
+| S5.3b | ✅ | `serve_chunked` plumbing: `--draft/--draft-config/--spec-k`, shared table, per-token logits, `run_pass()` |
+| S5.3c | ⏳ | the batched speculative step inside the server: draft pass 1 (prefill chunks + catch-up + pending), draft passes 2..K, one target pass (verify rows + prefill chunks), per-sequence accept and rollback |
+| S5.4 | ☐ | benchmark at concurrency **1 and 4** against the spec-off baselines below |
 
-## Stage 6 — Write-up
+### S5.0 — the prediction
 
-- **S6.1** One deep technical post: the scheduler, the paged cache, and the
-  measure-then-build ordering that reshaped the plan.
-- **S6.2** Repo polish: architecture diagram, consolidated benchmark tables.
+1B → 3B, batch 1, context 256, min of 5:
+
+| | batch 1 | batch 4 |
+|---|---:|---:|
+| `c_t` (3B, q=1) | 11.46 ms | 11.86 ms |
+| `c_d` (1B, q=1) | 5.36 ms | 4.83 ms |
+| `c_d / c_t` | **0.467** | 0.407 |
+| `c_v(2) / c_t` | 1.02 | 1.07 |
+| α (teacher-forced match rate) | **0.808** | 0.808 |
+| `tau(2)` | 2.465 | 2.465 |
+| best predicted speedup | **1.26× at K=2** | 1.31× at K=2 |
+
+`speedup(K) = tau(K) · c_t / (K · c_d + c_v(K))`. **The draft is too expensive:**
+α is good, but at `c ≈ 0.47` the ceiling is ~1.3×; 2× needs `c ≲ 0.1`. The 1B is
+also *less* bandwidth-efficient than the 3B (~460 vs ~560 GB/s, 51% vs 62% of peak),
+which is why `c` exceeds the 0.39 bytes ratio. Kept anyway — the mechanism is the
+point, and a measured, explained 1.27× is a valid result. Ways to lower `c`, recorded
+for later: INT4 draft + vocabulary-trimmed draft lm_head (~1.8–2.0× predicted);
+INT8 8B target with INT8 1B draft (~1.65×, Stage 8); EAGLE-style heads (need training).
+
+### S5.2 — the measurement
+
+16 prompts × 128 tokens, K = 2, against plain 3B greedy decoding:
+
+| | predicted | measured |
+|---|---:|---:|
+| decode speedup | 1.26× | **1.272×** (11.22 → 8.82 ms/token) |
+| tokens per round | 2.465 | 2.444 |
+| accepted a = 0 / 1 / 2 | 19.2 / 15.5 / 65.3 % | 19.1 / 17.3 / 63.5 % |
+| TTFT increase (both models prefill) | ~40% | **+42%** |
+| prompts with a near-tie divergence | 1 − 0.9941¹²⁸ = 53% | 8 / 16 |
+
+**Correctness: 16/16 pass, 0 FAIL** — 8 token-identical, 8 diverging only at fp16
+near-ties (top-2 gap 0.016–0.047).
+
+**Findings worth carrying forward:**
+
+- **Exact in theory, not bit-exact in practice.** A K+1-row verify GEMM and a 1-row
+  decode GEMM accumulate in different orders; target self-consistency is 99.41% per
+  token. The correctness test is therefore "identical, or diverges at a near-tie"
+  (top-2 logit gap below a threshold), and the near-tie rate is *predicted* from the
+  per-token flip rate. A broken implementation diverges at positions 1–3 with gaps up
+  to 8.6 — the two failure signatures are unmistakable.
+- **τ alone decides per-prompt speedup.** Per-prompt speedup ranged 1.08–1.36×, but
+  `tau × ms/token` (ms per round) was constant at ~21.7 ms for every prompt: the cost
+  side is fixed, acceptance varies with how predictable the text is. Near-tie prompts
+  cluster at low τ — uncertain text causes both.
+- **Rollback is bookkeeping.** Rejected KV stays in the pool, never read (the mask is
+  `n_keys = q_pos + 1`) and overwritten next round. `truncate()` only returns whole
+  blocks.
+- **The draft lags the target by at most one position.** After a fully accepted round
+  the draft never fed `d_K`; the next round's first draft pass feeds `[d_K, bonus]`
+  (q_len 2). The varlen kernel makes catch-up free — no special case.
+- **Invariant checks verify counts; the oracle verifies content.** The first
+  implementation emitted the rejected draft `d[a]` instead of the target's `g[a]`
+  (and read out of bounds when `a == K`). Every count was right; the oracle caught it
+  on the first run.
+- **Memory:** one table means each block costs target + draft bytes — 868 blocks vs
+  1,116 at 2 GB, **22% less KV capacity**.
+
+### Spec-off 3B baselines for S5.4
+
+`serve_chunked`, 3B, ~203-token prompts:
+
+| | concurrency 1 | concurrency 32 |
+|---|---:|---:|
+| throughput | 81.8 tok/s | 528 tok/s |
+| TTFT p50 | **62.7 ms** | 2,984 ms |
+| TPOT p50 | **11.82 ms** | 12.85 ms |
+
+- **TTFT at concurrency 32 is ~98% queueing.** Same prefill, same GPU: 62.7 ms alone,
+  2,984 ms behind 31 others with a 512-token budget per step.
+- **The server adds ~0.7 ms per forward pass** over the offline harness (11.82 vs
+  ~11.1 ms). Speculation runs ~1.23 passes per token, so this overhead costs it slightly
+  more than it costs plain decoding.
+- **The 3B is prefill-bound at high concurrency, and the cause is the attention
+  kernel.** TPOT scales with weight bytes (2.2× the 1B), but TTFT is 12× worse:
+  28 layers, `head_dim` 128 through the same 11.6%-efficient access pattern. At
+  concurrency 32 speculation would make this worse (a second prefill, ~+40%), which
+  is why S5.4 measures at 1 and 4. **This raised Stage 6's priority** — a
+  measure-first reordering, like the vLLM comparison before it.
+
+## Roadmap after Stage 5 — slimmed (2026-11-18)
+
+Reordered for the goal (senior inference roles), not for feature count: depth in a
+few things that can be defended completely, plus fluent concepts for the rest.
+Multi-GPU moved up because "no distributed experience" is a bigger gap for
+NVIDIA/CoreWeave-type roles than any single-GPU feature. CUDA graphs and prefix
+caching shrank to short experiments: their interview value is mostly conceptual.
+
+| # | Stage | Size | Why it is here |
+|---|---|---|---|
+| 6 | Paged varlen attention in CUDA (FA-2 → serving) | ~1 week | most-asked kernel topic; the measured 3B bottleneck |
+| 7 | Tensor parallelism, 2 rented GPUs | ~1 week | closes the multi-GPU gap |
+| 8 | Weight-only quantized GEMV (W8A16 / W4A16) | ~1 week | needed for the edge comparison; lowers spec `c` |
+| 9 | Jetson Orin Nano 8 GB vs llama.cpp | days (reuses `llama_jetson`) | edge story, bandwidth-bound regime |
+| 10 | Short experiments: CUDA graphs, prefix caching | 1–2 + 3–4 days | concept plus one number each |
+| 11 | Production completeness (sampling, chat, RoPE scaling) | only if a role needs it | |
+| 12 | Write-up + mock system-design interviews | ongoing | turning the work into offers |
+
+## Stage 6 — Paged varlen attention in CUDA
+
+**Prior work, not redone:** `../Triton/flash-attention-triton` is a FlashAttention-2
+forward pass — online softmax with fp32 running max/sum and a rescaled accumulator,
+`exp2` with the scale folded into Q, tensor-core `tl.dot`, causal early exit,
+autotuned tiles. The algorithm is known. What that kernel does *not* handle is
+exactly what a serving engine needs, and that is the scope here:
+
+| | Triton FA-2 | this stage |
+|---|---|---|
+| layout | contiguous `(B, H, N, D)` | **paged**: K/V tiles loaded through `block_table`; a 16-token block is a natural tile |
+| batch | one N for all sequences | **varlen**: mixed prefill chunks + decode tokens via `q_seq` / `q_pos`; causal mask from `q_pos` per tile |
+| heads | Hq == Hkv | **GQA**: the Q heads sharing a KV head load its tile once (ratio 3 on the 3B, 4 on the 1B) |
+| decode, q_len = 1 | one query row idles most of a tile | **split-K (FlashDecoding)**: keys split across thread blocks, partial `(m, l, acc)` merged — online softmax across blocks instead of across iterations |
+| engine | Python | CUDA, called from `varlen_layer.h` |
+
+Fixes the Stage 4 finding: Phase 1 puts one thread per token, so adjacent lanes read
+128 bytes apart — **11.6% load efficiency**.
+
+- **Gates:** ncu load efficiency 11.6% → 90%+; matches the current kernel on
+  `test_paged_attention_varlen` (shuffled blocks, ragged batch, prefill vs N decodes);
+  `spec_offline` and chunk-size invariance still pass.
+- **Measure:** `bench_varlen_attention` per shape; 3B TTFT at concurrency 32
+  (2,984 ms now); re-run the vLLM comparison.
+- **Predict first:** the Stage 4 Amdahl ceiling (2× attention → ~31% faster step on the
+  1B). Attention's share is larger on the 3B in prefill — compute the ceiling there too.
+
+## Stage 7 — Tensor parallelism (2 rented GPUs)
+
+Megatron-style splits: column-parallel QKV / gate / up, row-parallel o_proj / down,
+one NCCL all-reduce after attention and one after the MLP; KV heads sharded across
+ranks (8 KV heads → 4 per GPU). One process per GPU, the scheduler on rank 0
+broadcasting each step's batch description.
+
+- **Predict first:** per-layer all-reduce bytes = 2 × tokens × hidden × 2 B; against the
+  interconnect bandwidth (PCIe vs NVLink), when does communication dominate a decode
+  step?
+- **Measure:** TPOT and throughput at TP=1 vs TP=2 on the same rented machine; the
+  fraction of the step spent in NCCL (nsys).
+- Rent for a weekend; record the instance type so the numbers can be reproduced.
+
+## Stage 8 — Weight-only quantized GEMV (W8A16 / W4A16)
+
+Not quantization research — a kernel: unpack, dequantize in registers, dot product,
+for 1 to K+1 rows. Prefill dequantizes one layer into fp16 scratch and uses cuBLAS
+(compute-bound, so the extra traffic is fine). Per-output-channel (W8) or group-wise
+(W4, g=128) scales. Verification changes from cosine 1.0 to top-1 agreement and
+perplexity delta.
+
+Then re-run Stage 5's unchanged speculative code with an INT4 draft (and optionally
+an INT8 Llama-3.1-8B target): a controlled experiment where the measured speedup
+should track `c` — predicted ~1.26× (now) → ~1.65–1.8×.
+
+## Stage 9 — Edge: Jetson Orin Nano 8 GB vs llama.cpp
+
+Same engine where the bottleneck is bytes per token and nothing else
+(102 GB/s vs 896 GB/s, concurrency 1, 8 GB unified memory). Reuses
+`../llama_jetson` (Orin setup, reference numbers: TRT Edge-LLM 28.2 vs llama.cpp
+18.1 tok/s on Qwen3-4B) and `../llama_benchmark` (llama.cpp benchmark scripts).
+
+- **Port:** `sm_87` (already in `CMakeLists.txt`), no TensorRT needed; alias the tied
+  lm_head to the embedding table (saves 0.5 GB on the 1B); KV budget 256–512 MB.
+- **Fits:** 1B fp16 yes; 3B only as INT4 (Stage 8); 1B + 3B speculation does not fit in fp16.
+- **Two comparisons, both reported:** (1) fp16 vs llama.cpp fp16 — runtime quality at
+  equal bytes; (2) W4A16 vs llama.cpp Q4_K_M — best vs best at equal bits.
+- **Method:** pin `nvpmodel` MAXN SUPER + `jetson_clocks`, watch thermals, min of N.
+- **Predict first:** ceiling = bandwidth ÷ bytes per token; then at the 5070 Ti's
+  measured efficiency (~51% for the 1B).
+
+## Stage 10 — Short experiments
+
+- **CUDA graphs (1–2 days):** capture one fixed-shape decode step (batch 1, in
+  `spec_offline`) and measure the drop in `c_d` — launch overhead hurts the small
+  draft most, so graphs also raise the speculative speedup. Compare with
+  `../llama_benchmark`'s llama.cpp graphs-on/off numbers. Write up why production
+  engines capture per batch-size bucket and pad.
+- **Prefix caching, allocator only (3–4 days):** hash full blocks by
+  (parent hash, tokens), refcount shared blocks, copy-on-write on the last partial
+  block, LRU eviction of unreferenced cached blocks — in `BlockAllocator` with host
+  tests, no server integration. Write up the design against vLLM's automatic prefix
+  caching and SGLang's RadixAttention.
+
+## Stage 11 — Production completeness (only if a target role needs it)
+
+Sampling path in the server (segmented top-k/top-p for B rows), then the speculative
+acceptance rule for sampling — accept with `min(1, p_target/p_draft)`, resample from
+`max(0, p_target − p_draft)`, provably the same distribution as plain sampling.
+`/v1/chat/completions` with the chat template. LLaMA-3 RoPE frequency scaling
+(`rope_type: llama3`), which short-context verification cannot catch.
+
+## Stage 12 — Write-up
+
+- One deep technical post: the scheduler, the paged cache, speculative decoding's
+  cost model, and the measure-then-build ordering that reshaped the plan three times.
+- Repo polish: architecture diagram, consolidated benchmark tables, datacenter vs edge.
+- Mock system-design interviews defending every decision above.
 
 ---
 
@@ -304,17 +499,30 @@ throughput. It is a low-concurrency latency feature, not a throughput feature.
 
 - Stage 2A throughput collapse above B=16 — never root-caused; superseded by 2B.
 - Prefill throughput peaked at 512 tokens (41k tok/s) and fell to 10k at 1900 in the
-  TRT path. Moot now that prefill runs on the custom kernel, but the same O(n²)
-  question applies to `paged_attention_varlen` and S4.2 should measure it.
-- TTFT p95 (253 ms) remains 1.6× vLLM's (161 ms) in every configuration tried. Not
-  chunk monopolization — `max_chunk` didn't move it. Suspect admission queueing;
-  needs a concurrency sweep to confirm.
-- Every benchmark is a single run. No repeats, no variance, no error bars.
-- Only 256-token prompts were swept. The gap to vLLM should widen at longer contexts.
+  TRT path. The same O(n²) question applies to `paged_attention_varlen`; Stage 6
+  should measure it.
+- TTFT p95 (253 ms) remained 1.6× vLLM's (161 ms) in every configuration tried.
+  The 3B concurrency-1 vs 32 runs show TTFT under load is dominated by queueing; a
+  concurrency sweep would confirm whether that explains the p95 gap too.
+- The 1B draft step is *faster* at batch 4 (4.83 ms) than at batch 1 (5.36 ms).
+  Hypothesis: cuBLAS chooses a poor kernel for `n = 1`. Confirm with nsys kernel names.
+- The 1B reaches only ~51% of peak bandwidth at batch 1 vs ~62% for the 3B — launch
+  overhead per layer is a larger share of a small model's step (Stage 10, CUDA graphs).
+- Every benchmark is a single run. No repeats, no variance, no error bars — a 1%
+  difference (1.272× vs 1.26× predicted) is inside the noise.
+- Only ~200–256-token prompts were swept. The gap to vLLM should widen at longer contexts.
 
 ## Explicitly deprioritized
 
-- More quantization work (enough depth already)
+- Quantization *research* (GPTQ/AWQ variants, QAT) — enough depth already
+  (`../Quantization`). The quantized GEMV kernel (Stage 8) is in scope because the
+  edge comparison needs it.
+- Re-deriving FlashAttention — done in Triton (`../Triton/flash-attention-triton`);
+  Stage 6 builds only the serving-specific parts.
+- Full CUDA-graph integration and full prefix-caching integration in the server —
+  reduced to Stage 10 experiments.
 - MLIR/TVM (different career track)
 - k8s (learn on the job if a role requires it)
 - Full Unicode pre-tokenizer (needs PCRE2/ICU; ASCII approximation verified 8/8)
+- Trained draft heads (EAGLE/Medusa) — the right production answer, but a training
+  project, not an inference one

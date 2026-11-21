@@ -55,7 +55,9 @@ struct Seq {
     uint64_t id = 0;
     std::vector<int> prompt;
     std::vector<int> output;
-    int len     = 0;             // tokens already in the KV cache
+    int len     = 0;             // tokens already in the (target) KV cache
+    int draft_len = 0;           // S5: positions [0, draft_len) hold valid DRAFT KV.
+                                 //     Invariant while decoding: len-1 <= draft_len <= len
     int max_new = 64;
     std::shared_ptr<http::Stream> stream;
     Clock::time_point t_submit, t_first;
@@ -86,6 +88,9 @@ int main(int argc, char** argv) {
     // 0 = unlimited.
     int    max_admits_per_step = 0;
     double kv_budget_mb = 1024;
+    // ── S5 speculative decoding: off unless --spec-k > 0 ──
+    std::string draft_wdir, draft_cfg_path;
+    int spec_k = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -103,17 +108,54 @@ int main(int argc, char** argv) {
         else if (a == "--max-admits-per-step" && i+1<argc)
             max_admits_per_step = std::stoi(argv[++i]);
         else if (a == "--kv-budget-mb" && i+1<argc) kv_budget_mb = std::stod(argv[++i]);
+        else if (a == "--draft"        && i+1<argc) draft_wdir     = argv[++i];
+        else if (a == "--draft-config" && i+1<argc) draft_cfg_path = argv[++i];
+        else if (a == "--spec-k"       && i+1<argc) spec_k = std::stoi(argv[++i]);
     }
     // Decodes are granted unconditionally, so the budget must at least cover a
     // full batch of them or every step overruns it.
     max_batched_tokens = std::max(max_batched_tokens, max_batch);
 
+    // S5: a decoding sequence verifies K+1 tokens per step, and every one of
+    // them needs logits — so logits/out_rows are sized per TOKEN of decode,
+    // not per sequence. With spec off, decode_tokens == 1 and nothing changes.
+    const bool spec = spec_k > 0;
+    if (spec && (draft_wdir.empty() || draft_cfg_path.empty())) {
+        fprintf(stderr, "--spec-k needs --draft <dir> and --draft-config <config.json>\n");
+        return 1;
+    }
+    const int decode_tokens = spec ? spec_k + 1 : 1;
+    const int max_out = max_batch * decode_tokens;          // logits rows per step
+    max_batched_tokens = std::max(max_batched_tokens, max_out);
+    // Draft pass 1 carries every prefill chunk PLUS each decoder's pending
+    // token and possibly one catch-up token.
+    const int max_draft_rows = max_batched_tokens + max_batch;
+
     ModelConfig cfg;  cfg.load(cfg_path, max_seq);  cfg.print();
     Tokenizer   tok;  tok.load(tok_path);
     Weights weights;  weights.load(wdir, cfg);
 
-    const size_t bytes_per_block = (size_t)cfg.num_layers * 2 * cfg.num_kv_heads
-                                 * block_size * cfg.head_dim * sizeof(__half);
+    ModelConfig dcfg;
+    Weights dweights;
+    if (spec) {
+        dcfg.load(draft_cfg_path, max_seq);  dcfg.print();
+        dweights.load(draft_wdir, dcfg);
+        if (dcfg.vocab_size != cfg.vocab_size) {   // token ids must mean the same thing
+            fprintf(stderr, "draft vocab %d != target vocab %d: not a valid draft\n",
+                    dcfg.vocab_size, cfg.vocab_size);
+            return 1;
+        }
+    }
+
+    // ONE allocator and ONE block table serve both models, so a block id exists
+    // in both pools at once and costs target bytes + draft bytes.
+    const size_t bytes_per_block_t = (size_t)cfg.num_layers * 2 * cfg.num_kv_heads
+                                   * block_size * cfg.head_dim * sizeof(__half);
+    const size_t bytes_per_block_d = spec
+        ? (size_t)dcfg.num_layers * 2 * dcfg.num_kv_heads * block_size * dcfg.head_dim
+              * sizeof(__half)
+        : 0;
+    const size_t bytes_per_block = bytes_per_block_t + bytes_per_block_d;
     const int num_blocks = (int)((kv_budget_mb * 1e6) / bytes_per_block);
     const int max_blocks_per_seq = (max_seq + block_size - 1) / block_size;
     const size_t pool_per_layer = (size_t)num_blocks * cfg.num_kv_heads
@@ -126,20 +168,90 @@ int main(int argc, char** argv) {
     CK(cudaMalloc(&k_pool, pool_per_layer * cfg.num_layers * sizeof(__half)));
     CK(cudaMalloc(&v_pool, pool_per_layer * cfg.num_layers * sizeof(__half)));
     CK(cudaMalloc(&x,      (size_t)max_batched_tokens * cfg.hidden_dim * sizeof(__half)));
-    CK(cudaMalloc(&logits, (size_t)max_batch * cfg.vocab_size * sizeof(__half)));
+    CK(cudaMalloc(&logits, (size_t)max_out * cfg.vocab_size * sizeof(__half)));
 
     int *d_table, *d_q_seq, *d_q_pos, *d_ids, *d_out_rows;
     CK(cudaMalloc(&d_table,    (size_t)max_batch * max_blocks_per_seq * sizeof(int)));
     CK(cudaMalloc(&d_q_seq,    (size_t)max_batched_tokens * sizeof(int)));
     CK(cudaMalloc(&d_q_pos,    (size_t)max_batched_tokens * sizeof(int)));
     CK(cudaMalloc(&d_ids,      (size_t)max_batched_tokens * sizeof(int)));
-    CK(cudaMalloc(&d_out_rows, (size_t)max_batch * sizeof(int)));
+    CK(cudaMalloc(&d_out_rows, (size_t)max_out * sizeof(int)));
 
-    DecodeScratch scratch;  scratch.alloc(cfg, max_batched_tokens, max_batch);
+    DecodeScratch scratch;  scratch.alloc(cfg, max_batched_tokens, max_out);
     BlockAllocator alloc;   alloc.configure({block_size, num_blocks, 0});
-    BatchedPicker picker;   picker.alloc(cfg.vocab_size, max_batch);
-    ChunkScheduler sched;   sched.configure({max_batched_tokens, max_chunk});
+    BatchedPicker picker;   picker.alloc(cfg.vocab_size, max_out);
+    ChunkScheduler sched;   sched.configure({max_batched_tokens, max_chunk, decode_tokens});
     cublasHandle_t blas;    cublasCreate(&blas);
+
+    // ── S5: draft model state. Its own pool, scratch and logits; the SAME
+    //    num_blocks, block table (d_table) and allocator as the target. ──────
+    __half *dk_pool = nullptr, *dv_pool = nullptr, *dx = nullptr, *dlogits = nullptr;
+    int *dd_ids = nullptr, *dd_q_seq = nullptr, *dd_q_pos = nullptr, *dd_out_rows = nullptr;
+    DecodeScratch dscratch;
+    BatchedPicker dpicker;
+    if (spec) {
+        const size_t dpool_per_layer = (size_t)num_blocks * dcfg.num_kv_heads
+                                     * block_size * dcfg.head_dim;
+        CK(cudaMalloc(&dk_pool, dpool_per_layer * dcfg.num_layers * sizeof(__half)));
+        CK(cudaMalloc(&dv_pool, dpool_per_layer * dcfg.num_layers * sizeof(__half)));
+        CK(cudaMalloc(&dx,      (size_t)max_draft_rows * dcfg.hidden_dim * sizeof(__half)));
+        CK(cudaMalloc(&dlogits, (size_t)max_batch * dcfg.vocab_size * sizeof(__half)));
+        CK(cudaMalloc(&dd_ids,      (size_t)max_draft_rows * sizeof(int)));
+        CK(cudaMalloc(&dd_q_seq,    (size_t)max_draft_rows * sizeof(int)));
+        CK(cudaMalloc(&dd_q_pos,    (size_t)max_draft_rows * sizeof(int)));
+        CK(cudaMalloc(&dd_out_rows, (size_t)max_batch * sizeof(int)));
+        dscratch.alloc(dcfg, max_draft_rows, max_batch);
+        dpicker.alloc(dcfg.vocab_size, max_batch);
+    }
+
+    /// One forward pass on either model, from host arrays, returning the argmax
+    /// of every out row (empty if out_rows is empty). The block table must
+    /// already be uploaded to d_table — both models read the same one.
+    ///   q_seq[g]  row of the flattened table that query token g belongs to
+    ///   q_pos[g]  its absolute position
+    /// Plumbing for S5.3c; the non-speculative path below does not use it.
+    auto run_pass = [&](bool use_draft,
+                        const std::vector<int>& ids, const std::vector<int>& q_seq,
+                        const std::vector<int>& q_pos, const std::vector<int>& out_rows)
+            -> std::vector<int> {
+        const int n = (int)ids.size(), n_out = (int)out_rows.size();
+        if (n == 0) return {};
+        int max_scan = 0;
+        for (int p : q_pos) max_scan = std::max(max_scan, p + 1);
+        int *ids_d = use_draft ? dd_ids : d_ids, *seq_d = use_draft ? dd_q_seq : d_q_seq,
+            *pos_d = use_draft ? dd_q_pos : d_q_pos, *out_d = use_draft ? dd_out_rows : d_out_rows;
+        CK(cudaMemcpy(ids_d, ids.data(),   n * sizeof(int), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(seq_d, q_seq.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(pos_d, q_pos.data(), n * sizeof(int), cudaMemcpyHostToDevice));
+        if (n_out) CK(cudaMemcpy(out_d, out_rows.data(), n_out * sizeof(int), cudaMemcpyHostToDevice));
+        std::vector<int> picked;
+        if (use_draft) {
+            forward_varlen(dcfg, dweights, blas, dscratch, ids_d, dx, dlogits, dk_pool, dv_pool,
+                           d_table, seq_d, pos_d, out_d, n, n_out, block_size, num_blocks,
+                           max_blocks_per_seq, max_scan, 0);
+            if (n_out) dpicker.argmax_batched(dlogits, n_out, picked, 0);
+        } else {
+            forward_varlen(cfg, weights, blas, scratch, ids_d, x, logits, k_pool, v_pool,
+                           d_table, seq_d, pos_d, out_d, n, n_out, block_size, num_blocks,
+                           max_blocks_per_seq, max_scan, 0);
+            if (n_out) picker.argmax_batched(logits, n_out, picked, 0);
+        }
+        return picked;
+    };
+
+    if (spec) {
+        printf("Speculative: K=%d (decode_tokens=%d), draft %d layers, "
+               "block = %.2f MB target + %.2f MB draft\n",
+               spec_k, decode_tokens, dcfg.num_layers,
+               bytes_per_block_t / 1e6, bytes_per_block_d / 1e6);
+        printf("KV pool:   %.0f MB -> %d blocks of %d tokens (shared table)\n",
+               kv_budget_mb, num_blocks, block_size);
+        // TODO(S5.3c): remove this guard once the speculative step loop exists.
+        fprintf(stderr, "S5.3c (speculative step loop) not implemented yet — "
+                        "loading and memory sizing OK, exiting.\n");
+        (void)run_pass;
+        return 0;
+    }
 
     std::mutex mu;
     std::condition_variable cv;
@@ -229,7 +341,7 @@ int main(int argc, char** argv) {
                 int n = 0;
                 for (const auto& s : running)
                     if (!s.prefilling())
-                        n += alloc.blocks_to_append(s.id, s.len, 1);
+                        n += alloc.blocks_to_append(s.id, s.len, 1);   // TODO(S5.3c): decode_tokens
                 return n;
             };
             while (alloc.num_free() < decode_blocks_needed() && running.size() > 1) {
@@ -377,6 +489,7 @@ int main(int argc, char** argv) {
     server.stop();
     printf("preemptions: %lld\n", preemptions);
     scratch.free(); weights.free(); picker.free();
+    if (spec) { dscratch.free(); dweights.free(); dpicker.free(); }
     cublasDestroy(blas);
     return 0;
 }

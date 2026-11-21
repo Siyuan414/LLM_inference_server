@@ -1,0 +1,16 @@
+{
+  "name": "s53b_regress",
+  "url": "http://localhost:8080/v1/completions",
+  "requests": 64,
+  "failed": 0,
+  "concurrency": 32,
+  "max_tokens": 64,
+  "prompt_tokens": 203,
+  "tokens": 4096,
+  "wall_s": 7.750281486998574,
+  "throughput_tok_s": 528.4969335463768,
+  "ttft_p50_ms": 2984.0900630006217,
+  "ttft_p95_ms": 3091.3873489989783,
+  "tpot_p50_ms": 12.847737825405414,
+  "tpot_mean_ms": 13.00051136309498
+}
