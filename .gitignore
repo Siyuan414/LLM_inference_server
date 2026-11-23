@@ -46,3 +46,10 @@ nohup.out
 
 # NOTE: benchmarks/*.json IS tracked on purpose — those are results, and
 # `bench_vs_vllm.py --compare` reads them.
+
+# ── Local planning notes (kept out of the repo) ──────────────────────────────
+INFERENCE_ENGINE_PLAN.md
+*_PLAN.md
+PLAN.md
+CLAUDE.md
+.claude/

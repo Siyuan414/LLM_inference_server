@@ -199,7 +199,6 @@ in `weights.h` when the manifest shows identical shapes.
 |---|---|
 | `README.md` | status table + quick start |
 | `IMPLEMENTATION.md` | what was built and how, with the bug catalogue and verification methodology |
-| `INFERENCE_ENGINE_PLAN.md` | roadmap, and why the order changed when measurements contradicted it |
 | `ARCHITECTURE.md` | this file |
 | `benchmarks/STAGE{1,2,2B,3}.md` | per-stage results |
 | `benchmarks/VS_VLLM.md` | the head-to-head, at two prompt lengths |

@@ -27,8 +27,6 @@ forward pass → chunked prefill → speculative decoding (in progress).
   and a reading order for coming back cold. Start here.
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — **how it was built**: design decisions,
   verification methodology, and the bugs worth remembering.
-- [INFERENCE_ENGINE_PLAN.md](INFERENCE_ENGINE_PLAN.md) — roadmap, and why the
-  ordering changed when measurements contradicted it.
 - `benchmarks/` — the numbers.
 
 ## Status
