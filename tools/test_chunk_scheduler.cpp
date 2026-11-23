@@ -86,7 +86,6 @@ int main() {
         CHECK_EQ(decodes, 20, "all 20 decoders got exactly 1 token");
         CHECK_EQ(p.total_tokens, 512, "budget fully used");
         CHECK_EQ(granted(p, 99), 492, "prefill got only the remainder");
-        CHECK(p.has_prefill(), "step needs the varlen kernel");
     }
 
     // ── Rule 2: FCFS, not split evenly ──────────────────────────────────────
@@ -216,14 +215,12 @@ int main() {
         empty.configure({kBlockSize, 100, 0});
         const auto p0 = s.plan({}, empty);
         CHECK_EQ(p0.total_tokens, 0, "no sequences -> empty plan");
-        CHECK(!p0.has_prefill(), "empty plan needs no varlen kernel");
 
         // All decoding: a pure decode step must not claim to need varlen.
         std::vector<SeqView> dec{{1, 5, 5}, {2, 7, 7}};
         auto a = make_alloc(100, dec);
         const auto p1 = s.plan(dec, a);
         CHECK_EQ(p1.total_tokens, 2, "two decoders, two tokens");
-        CHECK(!p1.has_prefill(), "pure decode step: fast path still usable");
 
         // Budget smaller than the number of decoders: they are granted anyway,
         // because starving a mid-stream decode is worse than a long step.
@@ -235,6 +232,61 @@ int main() {
         const auto p2 = tight.plan(many, a2);
         CHECK_EQ(p2.total_tokens, 10, "decodes exceed budget but are not dropped");
     }
+
+       // ── Speculative decoding: decoders take K+1 tokens each ─────────────────
+    {
+        printf("spec: decode_tokens = 3 grants K+1 to every decoder\n");
+        // 1. SEQUENCES: SeqView{id, len, prompt_len}. len == prompt_len means
+        //    "finished its prompt", i.e. a decoder. {99, 0, 1000} is a prompt
+        //    that hasn't started.
+        std::vector<SeqView> seqs;
+        for (uint64_t i = 1; i <= 20; ++i) seqs.push_back({i, 10, 10});
+        seqs.push_back({99, 0, 1000});
+
+        // 2. ALLOCATOR whose state matches: each sequence owns blocks_for(len).
+        auto a = make_alloc(1000, seqs);          // big pool: blocks aren't the limit here
+
+        // 3. SCHEDULER: {max_batched_tokens, max_chunk, decode_tokens}
+        ChunkScheduler s;
+        s.configure({512, 512, 3});
+
+        // 4. PLAN
+        const auto p = s.plan(seqs, a);
+
+        // 5. CHECK: each one names the bug it catches
+        int decodes = 0;
+        for (uint64_t i = 1; i <= 20; ++i) decodes += granted(p, i);
+        CHECK_EQ(decodes, 60, "every decoder gets K+1, not 1");
+        CHECK_EQ(granted(p, 99), 512 - 60, "prefill gets the budget left after K+1 decodes");
+        CHECK(plan_is_affordable(p, a, seqs), "spec plan is affordable");
+    }
+
+    {
+        printf("spec: K+1 decodes crossing a block boundary are counted\n");
+        // 1. SEQUENCES: SeqView{id, len, prompt_len}. len == prompt_len means
+        //    "finished its prompt", i.e. a decoder. {99, 0, 1000} is a prompt
+        //    that hasn't started.
+        std::vector<SeqView> seqs;
+        for (uint64_t i = 1; i <= 20; ++i) seqs.push_back({i, 14, 14});
+        seqs.push_back({99, 0, 1000});
+
+        // 2. ALLOCATOR whose state matches: each sequence owns blocks_for(len).
+        auto a = make_alloc(20+24, seqs);          // big pool: blocks aren't the limit here
+
+        // 3. SCHEDULER: {max_batched_tokens, max_chunk, decode_tokens}
+        ChunkScheduler s;
+        s.configure({512, 512, 3});
+
+        // 4. PLAN
+        const auto p = s.plan(seqs, a);
+
+        // 5. CHECK: each one names the bug it catches
+       
+        CHECK_EQ(granted(p, 99), 64,"prefill got 64, not 384: K+1 decode growth must be counted in blocks");
+        CHECK(plan_is_affordable(p, a, seqs), "spec plan is affordable");
+        CHECK_EQ(a.num_free(), 0, "pool drained to exactly zero");
+    }
+
 
     printf("\n%s\n", failures ? "FAILED" : "all tests passed");
     return failures ? 1 : 0;

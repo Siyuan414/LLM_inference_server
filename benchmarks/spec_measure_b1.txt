@@ -1,0 +1,24 @@
+Tokenizer: 128000 tokens, 280147 merges  (bos=128000 eos=128001)
+16 prompts, 128 generated tokens each, batch 4, context 256
+
+Weights:   28 layers, 7.21 GB on device
+Weights:   16 layers, 3.00 GB on device
+target self-consistency (multi-row == incremental): 2036/2048 = 99.41%
+draft per-token match (alpha):                      1654/2048 = 0.808
+
+step times, batch 4, context 256 (min of 5):
+  c_t target q=1   11.857 ms
+  c_d draft  q=1   4.825 ms   (c_d/c_t = 0.407)
+
+  K   c_v(K) ms  c_v/c_t   tau(K)   round ms   predicted speedup
+  1      12.065    1.018    1.803     16.889    1.266x
+  2      12.739    1.074    2.465     22.388    1.305x
+  3      13.446    1.134    2.917     27.920    1.239x
+  4      12.884    1.087    3.266     32.182    1.203x
+  5      13.681    1.154    3.664     37.804    1.149x
+  6      14.056    1.186    3.857     43.004    1.063x
+  7      14.523    1.225    4.104     48.295    1.008x
+  8      15.247    1.286    4.285     53.844    0.943x
+
+Prediction ignores host overhead, the draft catch-up row after a
+fully-accepted round, and rollback bookkeeping. Real <= predicted.

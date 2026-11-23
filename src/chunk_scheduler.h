@@ -80,12 +80,6 @@ struct ChunkPlan {
     std::vector<Entry> entries;
     int total_tokens = 0;        // sum of n_tokens; <= cfg.max_batched_tokens
 
-    /// True if any entry is a multi-token prefill chunk — i.e. this step needs
-    /// the varlen kernel rather than the decode fast path.
-    bool has_prefill() const {
-        for (const auto& e : entries) if (e.n_tokens > 1) return true;
-        return false;
-    }
 };
 
 class ChunkScheduler {
@@ -97,6 +91,9 @@ public:
 
         /// Most tokens any ONE sequence may take in a step (rule 3).
         int max_chunk = 512;
+        /// Query tokens granted to each DECODING sequence per step: 1 normally,
+        /// K+1 under speculative decoding (pending token + K drafts to verify).
+        int decode_tokens = 1;
     };
 
     void configure(const Config& c) { cfg_ = c; }
@@ -110,8 +107,8 @@ public:
                    const BlockAllocator& alloc) const {
         ChunkPlan p;
         int blocks_committed = 0;   // blocks this plan has already promised
-
-        // ── Rule 1: decodes first, one token each ────────────────────────────
+        int decode_tokens = cfg_.decode_tokens;     
+        // ── Rule 1: decodes first, decode_tokens each ────────────────────────────
         // A full pass BEFORE any prefill is considered. Walking the list once
         // and handling each sequence as encountered would let a 236-token
         // prompt at position 0 eat the budget the decoders behind it needed.
@@ -123,9 +120,9 @@ public:
         // block, and with 20 decoders mid-stride that is 20 blocks).
         for (const auto& seq : running) {
             if (!seq.prefilling()) {
-                p.entries.push_back({seq.id, 1});
-                p.total_tokens += 1;
-                blocks_committed += alloc.blocks_to_append(seq.id, seq.len, 1);
+                p.entries.push_back({seq.id, decode_tokens});
+                p.total_tokens += decode_tokens;
+                blocks_committed += alloc.blocks_to_append(seq.id, seq.len, decode_tokens);
             }
         }
 

@@ -4,9 +4,7 @@ An LLM inference server written from scratch in C++/CUDA: tokenizer, forward
 pass, KV cache, scheduler and HTTP front-end, with no inference framework in the
 hot path. Target model LLaMA-3.2-1B-Instruct (now also 3B), FP16, RTX 5070 Ti.
 
-This document is the *how*. [INFERENCE_ENGINE_PLAN.md](INFERENCE_ENGINE_PLAN.md)
-is the roadmap and the reasoning behind the ordering; `benchmarks/` holds the
-measurements.
+This document is the *how*; `benchmarks/` holds the measurements.
 
 ---
 
