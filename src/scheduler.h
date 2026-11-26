@@ -65,7 +65,6 @@ public:
     // ── Submission ───────────────────────────────────────────────────────────
     /// Queue a new request. Returns its id.
     uint64_t submit(Request r) {
-        // TODO
         //  - assign r.id = next_id_++
         //  - r.state = Waiting, r.t_submit = now
         //  - push onto waiting_
@@ -85,7 +84,6 @@ public:
     /// Returns nullptr when: nothing waiting, no free slot, or this step's
     /// admission budget is already spent.
     Request* next_admission(bool cache_has_free) {
-        // TODO
         //  - if (!cache_has_free || waiting_.empty()
         //        || admits_this_step_ >= cfg_.max_admits_per_step) return nullptr
         //  - move front of waiting_ into running_, return pointer to it
@@ -104,7 +102,6 @@ public:
 
     /// The runtime reports which slot the admitted request landed in.
     void mark_running(Request* r, int slot) {
-        // TODO: r->slot = slot; r->state = Running;
         if(r){
             r->slot = slot;
             r->state = ReqState::Running;
@@ -118,7 +115,6 @@ public:
     /// Returns true if the request just finished (EOS or hit its token limit),
     /// in which case the runtime must release the slot.
     bool on_token(int slot, int token, int eos_id, int eot_id) {
-        // TODO
         //  - find the running request with this slot
         //  - if output empty, stamp t_first_token (this is TTFT)
         //  - append token
@@ -143,7 +139,6 @@ public:
     /// Move a finished request out of `running_` into `done_`. The runtime calls
     /// this after BatchKVCache::release(slot).
     void retire(int slot) {
-        // TODO
         //  - find the running request with this slot
         //  - move it into done_ (erase from running_)
         //  - reset its slot to -1 (not strictly necessary)
@@ -167,7 +162,6 @@ public:
     /// Token to feed each running slot next step: the last generated token.
     /// Slots with no running request get a filler (their output is discarded).
     std::vector<int> next_tokens(int batch_size, int filler) const {
-        // TODO: [batch_size], indexed BY SLOT (not by request order)
         std::vector<int> tokens(batch_size, filler);
         for (const auto& req : running_) {
             if (req.slot >= 0 && req.slot < batch_size) {
@@ -180,7 +174,6 @@ public:
     }
 
 private:
-    // TODO: helper to find a running request by slot
     Request* find_slot(int slot) { 
         for (auto& req : running_) {
             if (req.slot == slot) {

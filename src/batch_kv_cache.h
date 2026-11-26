@@ -52,7 +52,6 @@ public:
     // ── Lifecycle ────────────────────────────────────────────────────────────
     void alloc(const Config& cfg) {
         cfg_ = cfg;
-        // TODO
         //  - k_[layer], v_[layer] : each cudaMalloc(max_batch*H*max_seq*D*2 bytes)
         //  - d_lens_              : int[max_batch] on device (the scatter kernel
         //                           reads this; it must live on the GPU)
@@ -82,7 +81,6 @@ public:
     }
 
     void free() {
-        // TODO: cudaFree everything
         for (auto& ptr : k_) {
             cudaFree(ptr);
         }
@@ -102,7 +100,6 @@ public:
 
     /// Claim a free slot. Returns the slot index, or -1 if none available.
     int acquire() {
-        // TODO: find first !active_[i], mark active, lens_[i] = 0, return i
         for (int i = 0; i < cfg_.max_batch; ++i) {
             if (!active_[i]) {
                 active_[i] = true;
@@ -123,7 +120,7 @@ public:
         lens_[slot] = 0;
     }
 
-    bool has_free() const { /* TODO */ 
+    bool has_free() const {
         for(int i = 0; i < cfg_.max_batch; ++i) {
             if (!active_[i]) {
                 return true;
@@ -135,7 +132,6 @@ public:
 
     /// TRT batch dimension: highest active slot + 1 (0 if none active).
     int batch_size() const {
-        // TODO
         for (int i = cfg_.max_batch - 1; i >= 0; --i) {
             if (active_[i]) {
                 return i + 1;
@@ -156,7 +152,6 @@ public:
                          const std::vector<__half*>& prefill_k,
                          const std::vector<__half*>& prefill_v,
                          cudaStream_t stream) {
-        // TODO
         //  for each layer: cudaMemcpy2DAsync(present_k_[l], k_[l], n_tokens*D*2, max_seq*D*2, stream)
         //                  same for v  
         for(int l = 0; l < cfg_.num_layers; ++l) {
@@ -183,7 +178,6 @@ public:
 
     /// Upload host lens_ to d_lens_ (the scatter kernel needs them on device).
     void sync_lens(cudaStream_t stream) {
-        // TODO
         cudaMemcpyAsync(d_lens_, lens_.data(), cfg_.max_batch * sizeof(int),
                         cudaMemcpyHostToDevice, stream);
     }
@@ -195,7 +189,6 @@ public:
               const std::vector<std::string>& past_v,
               const std::vector<std::string>& present_k,
               const std::vector<std::string>& present_v) const {
-        // TODO
         //  for each layer: ctx->setBindingDimensions(past_k[l], nvinfer1::Dims4{cfg_.max_batch, cfg_.num_kv_heads, cfg_.max_seq, cfg_.head_dim});
         //                  same for past_v, present_k, present_v   
         const int B = batch_size();
@@ -213,7 +206,6 @@ public:
     /// After a successful enqueue: scatter each slot's new token from `present`
     /// into cache[slot, :, lens[slot], :], then advance lens.
     void commit_step(cudaStream_t stream) {
-        // TODO
         //  for each layer: launch_scatter_new_kv(present_k_[l], k_[l], d_lens_,
         //                      B, H, D, /*past=*/max_seq, max_seq, stream)
         //                  same for v
@@ -249,7 +241,6 @@ public:
     /// Row b's real tokens, then dead padding, then the new token(s) — TRT
     /// appends new KV at index `past`, so the new columns are always last.
     std::vector<int64_t> build_mask(int seq) const {
-        // TODO: returns [B * (max_seq + seq)]
         // build a vector of size cfg_.max_batch * (cfg_.max_seq + seq), 
         // fill it with 0s, then for each active slot b, 
         // set the first lens_[b] elements to 1, and the last seq elements to 1.
@@ -274,7 +265,6 @@ public:
     /// pos[b] = [lens[b], lens[b]+1, ...] — each slot's OWN next position.
     /// Passing `past` here instead would misrotate RoPE.
     std::vector<int64_t> build_positions(int seq) const {
-        // TODO: returns [B * seq]
         const int B = batch_size();
         std::vector<int64_t> positions((size_t)B * seq, 0);
         for(int b = 0; b < B; ++b) {
