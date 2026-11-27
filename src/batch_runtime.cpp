@@ -75,7 +75,6 @@ struct Engine {
     std::vector<std::string>     pres_k, pres_v, past_k, past_v;
 
     void load(const char* path) {
-        // TODO: same as runtime.cpp Engine::load — deserialize, collect and sort
         //       the past_/pres_ tensor names, create BOTH contexts, and call
         //       setOptimizationProfileAsync(PROFILE_PREFILL / PROFILE_DECODE)
         //       on the respective context once here (not per step).
@@ -152,7 +151,6 @@ struct Buffers {
     int hidden_dim = 0, vocab_size = 0;
 
     void alloc(const ModelConfig& cfg, int max_batch, const char* lmh_path) {
-        // TODO
         //  - the six device buffers above, sized for max_batch
         //  - prefill_k/v: one cudaMalloc per layer of
         //      1 * num_kv_heads * max_seq * head_dim * sizeof(__half)

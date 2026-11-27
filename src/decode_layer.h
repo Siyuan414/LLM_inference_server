@@ -160,7 +160,6 @@ inline void forward_layer(const ModelConfig& cfg, const LayerWeights& w,
     const int I  = cfg.inter_dim;
 
     // ── Attention block ──────────────────────────────────────────────────────
-    // TODO
     //  1. launch_rmsnorm(x, w.input_norm, s.h, B, H, cfg.rms_eps, stream)
     //  2. gemm(blas, w.q_proj, s.h, s.q, QD, H, B)   and k, v with KD
     //  3. launch_rope(s.q, d_positions, B, cfg.num_q_heads,  cfg.head_dim, ...)
@@ -187,7 +186,6 @@ inline void forward_layer(const ModelConfig& cfg, const LayerWeights& w,
     gemm(blas, w.o_proj, s.attn, s.proj, H, QD, B);
     launch_residual_add(x, s.proj, B*H, stream);    
     // ── MLP block ────────────────────────────────────────────────────────────
-    // TODO
     //  7. launch_rmsnorm(x, w.post_norm, s.h, B, H, cfg.rms_eps, stream)
     //  8. gemm(gate_proj → s.gate, I, H, B) ; gemm(up_proj → s.up, I, H, B)
     //  9. launch_silu_mul(s.gate, s.up, s.act, B, I, stream)

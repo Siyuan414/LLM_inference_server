@@ -179,7 +179,6 @@ int main(int argc, char** argv) {
     int peak_batch = 0;
     double occupancy_sum = 0;
 
-    // TODO
     // while (!waiting.empty() || !running.empty()) {
     //
     //   1. ADMIT while there is room:

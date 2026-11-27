@@ -246,11 +246,6 @@ int main(int argc, char** argv) {
                bytes_per_block_t / 1e6, bytes_per_block_d / 1e6);
         printf("KV pool:   %.0f MB -> %d blocks of %d tokens (shared table)\n",
                kv_budget_mb, num_blocks, block_size);
-        // TODO(S5.3c): remove this guard once the speculative step loop exists.
-        fprintf(stderr, "S5.3c (speculative step loop) not implemented yet — "
-                        "loading and memory sizing OK, exiting.\n");
-        (void)run_pass;
-        return 0;
     }
 
     std::mutex mu;
@@ -288,6 +283,181 @@ int main(int argc, char** argv) {
 
     std::vector<Seq> waiting, running;
     long long preemptions = 0;
+
+    /// Append ONE generated token to `s` and stream it. Handles TTFT, the SSE
+    /// header, and EOS. Returns true when `s` must stop generating (EOS or
+    /// max_new reached) — the caller must not emit further tokens for it this
+    /// step. RETIRE removes the sequence afterwards. Plumbing for S5.3c.
+    auto emit = [&](Seq& s, int token) -> bool {
+        if (s.output.empty()) {
+            s.t_first = Clock::now();
+            if (s.stream->alive()) { s.stream->begin(); s.header_sent = true; }
+        }
+        s.output.push_back(token);
+        s.hit_eos = (token == tok.eos_id() || token == tok.eot_id());
+        if (!s.hit_eos && s.stream->alive()) s.stream->token(tok.decode({token}));
+        return s.hit_eos || (int)s.output.size() >= s.max_new;
+    };
+
+    // ════════════════════════════════════════════════════════════════════════
+    // S5.3c — YOUR CODE: one speculative step for every sequence in `plan`.
+    // ════════════════════════════════════════════════════════════════════════
+    /// Called after COMMIT: every entry's blocks are appended and the block
+    /// table (row r = running[r]) is already uploaded to d_table.
+    /// Decoders have e.n_tokens == K+1; prefill entries have their chunk size.
+    ///
+    /// Positions, for one decoder (K = 2), with L = s.len:
+    ///
+    ///   pos:      draft_len … L-1     L          L+1    L+2
+    ///   token:    (catch-up)          pending    d1     d2
+    ///   3B KV:    ✓                   ← target pass writes L .. L+K →
+    ///   1B KV:    hole if draft_len < L
+    ///
+    ///   The target NEVER catches up. The draft's hole is at most one position:
+    ///   after an all-accepted round it is d_K, at draft_len.
+    ///
+    /// Steps (your trace, as code):
+    ///   DRAFT 1   prefill entries: their chunk tokens at s.len .. s.len+n-1, no out row
+    ///             decoders: tokens[draft_len .. L] (token_at), out row = the last one -> d1
+    ///   DRAFT j   (j = 2..K) decoders only: d_{j-1} at L+j-1, out row each -> d_j
+    ///   TARGET    decoders: [pending, d1..dK] at L .. L+K, ALL K+1 rows out
+    ///                       verify_start[r] = out_rows.size() BEFORE pushing them
+    ///             prefill:  chunk tokens; out row only on the last token if the
+    ///                       chunk reaches the end of the prompt
+    ///   ACCEPT    a = leading matches of d[i] vs g[verify_start + i]
+    ///             emit d1..da then g[verify_start + a] — stop early if emit() says so
+    ///             s.len = L+1+a; s.draft_len = min(s.len, L+K); alloc.truncate(s.id, s.len)
+    ///   PREFILL   s.len += n; s.draft_len += n; if the prompt is now complete,
+    ///             emit its first token from its (packed!) index in g
+    ///
+    /// Reminders from the trace:
+    ///   * out_rows index rows of THIS pass — they restart at 0 every pass
+    ///   * g is packed: g[i] answers out_rows[i], not row i
+    ///   * q_seq is r, the index in `running` (= the row of the uploaded table)
+    ///
+    /// Tools: run_pass(use_draft, ids, q_seq, q_pos, out_rows) -> argmax per out row
+    ///        s.token_at(pos), emit(s, tok), alloc.truncate(id, len), spec_k
+
+
+    auto spec_step = [&](const ChunkPlan& plan) {
+        std::vector<int> dec_r;               // running index of each decoder
+        std::vector<int> pre_r, pre_n;        // prefill: running index + chunk size
+        for (const auto& e : plan.entries) {
+            // 1. find r such that running[r].id == e.id
+            // 2. prefilling? → pre_r / pre_n,  else → dec_r
+            int r = -1;
+            for(int i=0; i<(int)running.size(); ++i)
+                if(running[i].id == e.id){ r = i; break; }
+            if(r < 0){
+                fprintf(stderr, "BUG: spec_step() plan entry id=%llu not in running\n",
+                        (unsigned long long)e.id);
+                exit(1);   
+            }
+            if(running[r].prefilling()){
+                pre_r.push_back(r);
+                pre_n.push_back(e.n_tokens);
+            } else {
+                dec_r.push_back(r);
+            }
+        }
+        // ════ DRAFT pass 1 (1B): prefill chunks + each decoder's catch-up and pending ════
+        std::vector<int> dr_ids, dr_seq, dr_pos, dr_out;   // rows of THIS pass
+        for (size_t i = 0; i < pre_r.size(); ++i) {         // prefill: KV only, no out row
+            const int r = pre_r[i], n = pre_n[i];
+            const Seq& s = running[r];
+            for (int j = 0; j < n; ++j) {
+                dr_ids.push_back(s.token_at(s.len + j));
+                dr_seq.push_back(r);
+                dr_pos.push_back(s.len + j);
+            }
+        }
+        for (size_t i = 0; i < dec_r.size(); ++i) {         // decoders: draft_len .. L
+            const int r = dec_r[i];
+            const Seq& s = running[r];
+            const int n = s.len - s.draft_len;               // catch-up (0 or 1)
+            for (int p = 0; p <= n; ++p) {
+                dr_ids.push_back(s.token_at(s.draft_len + p));
+                dr_seq.push_back(r);
+                dr_pos.push_back(s.draft_len + p);
+            }
+            dr_out.push_back((int)dr_ids.size() - 1);        // last row -> d1
+        }
+        const std::vector<int> d1 = run_pass(/*use_draft=*/true, dr_ids, dr_seq, dr_pos, dr_out);
+        std::vector<std::vector<int>> drafts(dec_r.size());  // drafts[i] = {d1, d2, …}
+        for (size_t i = 0; i < dec_r.size(); ++i) drafts[i].push_back(d1[i]);
+
+        // ════ DRAFT passes 2..K (1B): decoders only, one row each ════
+        for (int j = 2; j <= spec_k; ++j) {
+            std::vector<int> ids, seq, pos, out;
+            for (size_t i = 0; i < dec_r.size(); ++i) {
+                const Seq& s = running[dec_r[i]];
+                ids.push_back(drafts[i].back());             // previous guess
+                seq.push_back(dec_r[i]);
+                pos.push_back(s.len + j - 1);                // d_{j-1} sits at L+j-1
+                out.push_back((int)out.size());              // rows restart at 0
+            }
+            const std::vector<int> dj = run_pass(/*use_draft=*/true, ids, seq, pos, out);
+            for (size_t i = 0; i < dec_r.size(); ++i) drafts[i].push_back(dj[i]);
+        }
+
+        // ════ TARGET pass (3B): prefill chunks + each decoder's K+1 verify rows ════
+        std::vector<int> t_ids, t_seq, t_pos, t_out;
+        std::vector<int> first_g(pre_r.size(), -1);          // prefill: index into g, or -1
+        for (size_t i = 0; i < pre_r.size(); ++i) {
+            const int r = pre_r[i], n = pre_n[i];
+            const Seq& s = running[r];
+            for (int j = 0; j < n; ++j) {
+                t_ids.push_back(s.token_at(s.len + j));
+                t_seq.push_back(r);
+                t_pos.push_back(s.len + j);
+            }
+            if (s.len + n >= s.prompt_len()) {               // chunk finishes the prompt
+                first_g[i] = (int)t_out.size();
+                t_out.push_back((int)t_ids.size() - 1);
+            }
+        }
+        std::vector<int> verify_start(dec_r.size(), -1);     // decoder: where its K+1 answers start in g
+        for (size_t i = 0; i < dec_r.size(); ++i) {
+            const int r = dec_r[i];
+            const Seq& s = running[r];
+            // ── PIECE (d), YOURS: rows [pending, d1..dK] at positions L .. L+K ──
+            t_ids.push_back(s.token_at(s.len));  t_seq.push_back(r);  t_pos.push_back(s.len);   // pending
+            for (int k = 0; k < spec_k; ++k) {
+                t_ids.push_back(drafts[i][k]);  t_seq.push_back(r);  t_pos.push_back(s.len+k+1);   // d_{k+1}
+            }
+            verify_start[i] = (int)t_out.size();              // BEFORE pushing its out rows
+            for (int k = 0; k <= spec_k; ++k)
+                t_out.push_back((int)t_ids.size() - (spec_k +1) + k);       // all K+1 rows just pushed
+        }
+        const std::vector<int> g = run_pass(/*use_draft=*/false, t_ids, t_seq, t_pos, t_out);
+
+        // ════ UPDATE prefill sequences ════
+        for (size_t i = 0; i < pre_r.size(); ++i) {
+            Seq& s = running[pre_r[i]];
+            s.len       += pre_n[i];
+            s.draft_len += pre_n[i];                         // the 1B saw the same chunk
+            if (first_g[i] >= 0) emit(s, g[first_g[i]]);     // first generated token
+        }
+
+        // ════ PIECE (e), YOURS: accept, emit, roll back — per decoder ════
+        for (size_t i = 0; i < dec_r.size(); ++i) {
+            Seq& s = running[dec_r[i]];
+            const int L = s.len;                             // pending token's position
+            int a = 0;
+            while (a < spec_k && drafts[i][a] == g[verify_start[i] + a]) ++a;
+
+            // EMIT: the a accepted drafts, then the 3B's bonus token.
+            // emit() returns true at EOS / max_new: emit nothing more for this seq.
+            bool stop = false;
+            for (int k = 0; k < a && !stop; ++k) stop = emit(s, drafts[i][k]);
+            if (!stop) emit(s, g[verify_start[i] + a]);
+
+            // ROLLBACK
+            s.len       = L + 1 + a;   // pending + accepted drafts
+            s.draft_len = std::min(L+1+a,L+spec_k);   // the 1B saw the same accepted drafts
+            alloc.truncate(s.id, s.len);
+        }
+    };
 
     while (true) {
         // ── DRAIN ────────────────────────────────────────────────────────────
@@ -332,16 +502,12 @@ int main(int argc, char** argv) {
         }
         if (running.empty()) continue;
 
-        // ── PREEMPT: make sure every decoder can take its one token ───────────
-        // Must run BEFORE planning: the scheduler grants decode tokens
-        // unconditionally, so if the pool cannot back them no plan is
-        // affordable. Newest-first (LIFO) — least work invested.
         {
             auto decode_blocks_needed = [&] {
                 int n = 0;
                 for (const auto& s : running)
                     if (!s.prefilling())
-                        n += alloc.blocks_to_append(s.id, s.len, 1);   // TODO(S5.3c): decode_tokens
+                        n += alloc.blocks_to_append(s.id, s.len, decode_tokens);
                 return n;
             };
             while (alloc.num_free() < decode_blocks_needed() && running.size() > 1) {
@@ -349,6 +515,7 @@ int main(int argc, char** argv) {
                 running.pop_back();
                 alloc.release(victim.id);
                 victim.len = 0;                   // discard partial prefill too
+                victim.draft_len = 0;
                 victim.output.clear();
                 alloc.allocate(victim.id, 0);
                 waiting.push_back(std::move(victim));   // re-admitted last
@@ -398,6 +565,7 @@ int main(int argc, char** argv) {
                 commit_failed = true;
                 break;
             }
+            if (spec) continue;                   // S5.3c builds its own passes
 
             for (int i = 0; i < e.n_tokens; ++i) {
                 const int pos = s.len + i;
@@ -415,6 +583,15 @@ int main(int argc, char** argv) {
             }
         }
         if (commit_failed) continue;
+
+        if (spec) {
+            // One table upload; every draft pass and the target pass reuse it.
+            const std::vector<int> table =
+                alloc.flatten(ids_of_running, max_blocks_per_seq);
+            CK(cudaMemcpy(d_table, table.data(), table.size()*sizeof(int),
+                          cudaMemcpyHostToDevice));
+            spec_step(plan);
+        } else {
 
         const int total_q = (int)h_ids.size();
         const int n_out   = (int)h_out_rows.size();
@@ -463,6 +640,8 @@ int main(int argc, char** argv) {
                     s.stream->token(tok.decode({picked[o]}));
             }
         }
+
+        }   // !spec
 
         // ── RETIRE ───────────────────────────────────────────────────────────
         for (int r = (int)running.size() - 1; r >= 0; --r) {

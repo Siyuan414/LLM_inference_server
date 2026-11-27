@@ -1,0 +1,16 @@
+{
+  "name": "s54_off_c1",
+  "url": "http://localhost:8080/v1/completions",
+  "requests": 16,
+  "failed": 0,
+  "concurrency": 1,
+  "max_tokens": 128,
+  "prompt_tokens": 256,
+  "tokens": 2048,
+  "wall_s": 23.455587190000188,
+  "throughput_tok_s": 87.31395140144362,
+  "ttft_p50_ms": 58.4903500002838,
+  "ttft_p95_ms": 59.85163800005466,
+  "tpot_p50_ms": 11.055496346456293,
+  "tpot_mean_ms": 11.081714036909643
+}

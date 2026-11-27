@@ -1,0 +1,16 @@
+{
+  "name": "s54_spec_c1",
+  "url": "http://localhost:8080/v1/completions",
+  "requests": 16,
+  "failed": 0,
+  "concurrency": 1,
+  "max_tokens": 128,
+  "prompt_tokens": 256,
+  "tokens": 2048,
+  "wall_s": 19.846879532999992,
+  "throughput_tok_s": 103.19002524274559,
+  "ttft_p50_ms": 56.69005099980495,
+  "ttft_p95_ms": 111.27169799965486,
+  "tpot_p50_ms": 9.125037181103663,
+  "tpot_mean_ms": 9.271139878936488
+}
